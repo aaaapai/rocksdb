@@ -57,15 +57,11 @@ jobs:
         
         # 构建 JNI 库
         make -j$(nproc) rocksdbjni
-        
-        # 验证构建结果
-        ls -la librocksdbjni.so || ls -la java/target/*.so
-        
+                
     - name: Archive artifacts
       uses: actions/upload-artifact@main
       with:
         name: rocksdb-android-aarch64-jni
         path: |
-          build-android-aarch64/librocksdbjni.so
-          build-android-aarch64/java/target/*.so
+          **/librocksdbjni.so
         retention-days: 7
