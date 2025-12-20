@@ -56,7 +56,7 @@ jobs:
           ..
         
         # 构建 JNI 库
-        make -j$(nproc) rocksdbjni
+        cmake --build . --config Release --parallel 6
                 
     - name: Archive artifacts
       uses: actions/upload-artifact@main
