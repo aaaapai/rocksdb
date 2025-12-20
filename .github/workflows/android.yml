@@ -2,19 +2,7 @@ name: Build Android aarch64 JNI
 
 on:
   push:
-    branches: [ main, master ]
-    paths:
-      - 'java/**'
-      - 'CMakeLists.txt'
-      - 'build_android.sh'
-      - '.github/workflows/android-aarch64.yml'
   pull_request:
-    branches: [ main, master ]
-    paths:
-      - 'java/**'
-      - 'CMakeLists.txt'
-      - 'build_android.sh'
-      - '.github/workflows/android-aarch64.yml'
 
 jobs:
   build-android-aarch64:
