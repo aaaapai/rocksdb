@@ -51,6 +51,8 @@ jobs:
           -DWITH_SNAPPY=OFF \
           -DWITH_LZ4=OFF \
           -DWITH_ZLIB=OFF \
+          -DWITH_ZSTD=ON \
+          -DROCKSDB_DISABLE_ZSTD=0 \
           -DCMAKE_BUILD_TYPE=Release \
           ..
         
