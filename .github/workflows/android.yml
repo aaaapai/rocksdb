@@ -26,16 +26,9 @@ jobs:
     # ==================== 2. 编译 zstd 动态库 (Android aarch64) ====================
     - name: Build zstd for Android aarch64
       run: |
-        # 清理旧文件
         rm -rf zstd zstd-build zstd-install
-        
-        # 浅克隆 zstd 源码
         git clone --depth 1 https://github.com/facebook/zstd.git
-        
-        # 创建独立的构建目录
         mkdir zstd-build && cd zstd-build
-        
-        # 配置 CMake 交叉编译
         cmake ../zstd/build/cmake \
           -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
           -DANDROID_ABI=arm64-v8a \
@@ -43,25 +36,17 @@ jobs:
           -DCMAKE_INSTALL_PREFIX=${GITHUB_WORKSPACE}/zstd-install \
           -DZSTD_BUILD_STATIC=OFF \
           -DZSTD_BUILD_SHARED=ON \
-          -DZSTD_BUILD_PROGRAMS=OFF   # 关键：禁用 CLI 程序，避免需要静态库
-        
-        # 编译并安装
+          -DZSTD_BUILD_PROGRAMS=OFF
         cmake --build . --parallel 6
         cmake --install .
-        
-        # 验证产物
         ls -la ${GITHUB_WORKSPACE}/zstd-install/lib/
 
-    # ==================== 3. 编译 RocksDB JNI (使用 ccache + 链接 zstd) ====================
+    # ==================== 3. 编译 RocksDB JNI (启用 ZSTD 支持) ====================
     - name: Build RocksDB JNI for Android aarch64
       run: |
-        # 让 CMake 使用 ccache
         export PATH="/usr/lib/ccache:$PATH"
-        
-        # 创建 RocksDB 构建目录
         mkdir -p build-android-aarch64 && cd build-android-aarch64
         
-        # 设置 NDK 工具链变量
         export TOOLCHAIN=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64
         export TARGET=aarch64-linux-android
         export API=26
@@ -73,12 +58,13 @@ jobs:
         export RANLIB=$TOOLCHAIN/bin/llvm-ranlib
         export STRIP=$TOOLCHAIN/bin/llvm-strip
         
-        # 指定 zstd 路径（刚刚编译好的动态库）
         export ZSTD_DIR=${GITHUB_WORKSPACE}/zstd-install
         export ZSTD_LIBRARIES=$ZSTD_DIR/lib/libzstd.so
         export ZSTD_INCLUDE_DIRS=$ZSTD_DIR/include
         
-        # 配置 RocksDB CMake
+        # 关键：定义 ROCKSDB_ZSTD 宏，并保留原有的优化标志
+        export COMMON_FLAGS="-fPIC -O3 -mllvm -polly -DROCKSDB_ZSTD=1"
+        
         cmake \
           -DCMAKE_SYSTEM_NAME=Android \
           -DCMAKE_SYSTEM_VERSION=$API \
@@ -87,8 +73,8 @@ jobs:
           -DCMAKE_ANDROID_STL_TYPE=c++_static \
           -DCMAKE_C_COMPILER="$CC" \
           -DCMAKE_CXX_COMPILER="$CXX" \
-          -DCMAKE_C_FLAGS="-fPIC -O3 -mllvm -polly" \
-          -DCMAKE_CXX_FLAGS="-fPIC -O3 -mllvm -polly" \
+          -DCMAKE_C_FLAGS="$COMMON_FLAGS" \
+          -DCMAKE_CXX_FLAGS="$COMMON_FLAGS" \
           -DZSTD_LIBRARIES="$ZSTD_LIBRARIES" \
           -DZSTD_INCLUDE_DIRS="$ZSTD_INCLUDE_DIRS" \
           -DJNI=ON \
@@ -102,10 +88,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release \
           ..
         
-        # 编译
         cmake --build . --config Release --parallel 6
-        
-        # 查看产物
         ls -la librocksdb* 2>/dev/null || true
 
     # ==================== 4. 上传产物 ====================
@@ -115,6 +98,6 @@ jobs:
         name: rocksdb-android-aarch64-jni
         path: |
           build-android-aarch64/librocksdb.so
-          build-android-aarch64/librocksdbjni.so
+          **/librocksdbjni.so
           zstd-install/lib/libzstd.so
         retention-days: 7
