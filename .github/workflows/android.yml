@@ -63,7 +63,7 @@ jobs:
         export ZSTD_INCLUDE_DIRS=$ZSTD_DIR/include
         
         # 关键：定义 ROCKSDB_ZSTD 宏，并保留原有的优化标志
-        export COMMON_FLAGS="-fPIC -O3 -mllvm -polly -DROCKSDB_ZSTD=1"
+        export COMMON_FLAGS="-fPIC -O3 -mllvm -polly -DROCKSDB_ZSTD=1 -DZSTD"
         
         cmake \
           -DCMAKE_SYSTEM_NAME=Android \
