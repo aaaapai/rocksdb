@@ -9,6 +9,8 @@
 //
 #pragma once
 
+#define ZSTD 1
+
 #include <algorithm>
 
 #include "memory/memory_allocator_impl.h"
