@@ -124,10 +124,10 @@ Status CheckCompressionSupportedWithManager(
     }
   } else {
     if (!CompressionTypeSupported(type)) {
-      if (type <= kLastBuiltinCompression) {
+      /*if (type <= kLastBuiltinCompression) {
         return Status::InvalidArgument("Compression type " +
                                        CompressionTypeToString(type) +
-                                       " is not linked with the binary.");
+                                       " is not linked with the binary.");*/
       } else {
         return Status::NotSupported(
             "Compression type " + CompressionTypeToString(type) +
