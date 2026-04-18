@@ -42,7 +42,8 @@ jobs:
           -DANDROID_PLATFORM=android-26 \
           -DCMAKE_INSTALL_PREFIX=${GITHUB_WORKSPACE}/zstd-install \
           -DZSTD_BUILD_STATIC=OFF \
-          -DZSTD_BUILD_SHARED=ON
+          -DZSTD_BUILD_SHARED=ON \
+          -DZSTD_BUILD_PROGRAMS=OFF   # 关键：禁用 CLI 程序，避免需要静态库
         
         # 编译并安装
         cmake --build . --parallel 6
