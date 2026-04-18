@@ -82,10 +82,15 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 message(STATUS "CMAKE_BUILD_TYPE is set to ${CMAKE_BUILD_TYPE}")
 
+# Use ccache for compilation if available. Use CMAKE_C/CXX_COMPILER_LAUNCHER
+# instead of RULE_LAUNCH_COMPILE to avoid double-wrapping when ccache is also
+# injected via PATH (e.g., /usr/lib/ccache or brew --prefix ccache/libexec).
+# Note: we intentionally do NOT set RULE_LAUNCH_LINK because ccache cannot
+# cache link operations -- it only adds overhead.
 find_program(CCACHE_FOUND ccache)
 if(CCACHE_FOUND)
-  set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ccache)
-  set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
+  set(CMAKE_C_COMPILER_LAUNCHER ccache)
+  set(CMAKE_CXX_COMPILER_LAUNCHER ccache)
 endif(CCACHE_FOUND)
 
 option(WITH_JEMALLOC "build with JeMalloc" OFF)
@@ -218,6 +223,10 @@ if(MSVC)
   else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Zi /nologo /EHsc /GS /Gd /GR /GF /fp:precise /Zc:wchar_t /Zc:forScope /errorReport:queue")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /FC /d2Zi+ /W4 /wd4127 /wd4996 /wd4100 /wd4324")
+  endif()
+  if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /DNDEBUG")
+    message(STATUS "Setting /DNDEBUG as CMAKE_BUILD_TYPE is set to ${CMAKE_BUILD_TYPE}")
   endif()
 else()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -W -Wextra -Wall -pthread")
@@ -511,6 +520,15 @@ elseif(CMAKE_SYSTEM_NAME MATCHES "iOS")
   add_definitions(-DOS_MACOSX -DIOS_CROSS_COMPILE)
 elseif(CMAKE_SYSTEM_NAME MATCHES "Linux")
   add_definitions(-DOS_LINUX)
+  # Use lld linker if available for faster linking (12x faster than ld.bfd)
+  if(NOT ROCKSDB_NO_FAST_LINKER)
+    execute_process(COMMAND ${CMAKE_CXX_COMPILER} -fuse-ld=lld -Wl,--version
+      OUTPUT_VARIABLE LLD_VERSION_OUTPUT ERROR_QUIET RESULT_VARIABLE LLD_RESULT)
+    if(LLD_RESULT EQUAL 0 AND LLD_VERSION_OUTPUT MATCHES "LLD")
+      set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=lld")
+      set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fuse-ld=lld")
+    endif()
+  endif()
 elseif(CMAKE_SYSTEM_NAME MATCHES "SunOS")
   add_definitions(-DOS_SOLARIS)
 elseif(CMAKE_SYSTEM_NAME MATCHES "kFreeBSD")
@@ -656,10 +674,38 @@ if(USE_FOLLY)
     endif()
   endif()
 
+  # Folly itself uses gflags transitively, but RocksDB tools and benchmarks
+  # also call gflags APIs directly, so they need an explicit link dependency.
+  if(WITH_GFLAGS)
+    if(NOT TARGET gflags::gflags AND NOT TARGET gflags_shared AND
+       NOT gflags_LIBRARIES)
+      find_package(gflags CONFIG QUIET)
+      if(NOT gflags_FOUND)
+        find_package(gflags REQUIRED)
+      endif()
+    endif()
+    if(TARGET gflags::gflags)
+      set(GFLAGS_LIB gflags::gflags)
+    elseif(TARGET gflags_shared)
+      set(GFLAGS_LIB gflags_shared)
+    elseif(DEFINED GFLAGS_TARGET AND TARGET ${GFLAGS_TARGET})
+      set(GFLAGS_LIB ${GFLAGS_TARGET})
+    elseif(gflags_LIBRARIES)
+      set(GFLAGS_LIB ${gflags_LIBRARIES})
+    else()
+      message(FATAL_ERROR
+        "WITH_GFLAGS is enabled, but no gflags library could be resolved")
+    endif()
+    list(APPEND THIRDPARTY_LIBS ${GFLAGS_LIB})
+  endif()
+
   add_compile_definitions(USE_FOLLY FOLLY_NO_CONFIG HAVE_CXX11_ATOMIC)
   list(APPEND THIRDPARTY_LIBS Folly::folly)
   set(FOLLY_LIBS Folly::folly)
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--copy-dt-needed-entries")
+  # --copy-dt-needed-entries is ld.bfd-specific; lld handles DT_NEEDED transitively
+  if(NOT CMAKE_EXE_LINKER_FLAGS MATCHES "fuse-ld=lld")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--copy-dt-needed-entries")
+  endif()
 endif()
 find_package(Threads REQUIRED)
 
@@ -686,6 +732,7 @@ set(SOURCES
         db/blob/blob_file_addition.cc
         db/blob/blob_file_builder.cc
         db/blob/blob_file_cache.cc
+        db/blob/blob_file_partition_manager.cc
         db/blob/blob_file_garbage.cc
         db/blob/blob_file_meta.cc
         db/blob/blob_file_reader.cc
@@ -694,6 +741,7 @@ set(SOURCES
         db/blob/blob_log_sequential_reader.cc
         db/blob/blob_log_writer.cc
         db/blob/blob_source.cc
+        db/blob/blob_write_batch_transformer.cc
         db/blob/prefetch_buffer_collection.cc
         db/builder.cc
         db/c.cc
@@ -762,8 +810,10 @@ set(SOURCES
         db/version_edit.cc
         db/version_edit_handler.cc
         db/version_set.cc
+        db/version_util.cc
         db/wal_edit.cc
         db/wal_manager.cc
+        db/wide/read_path_blob_resolver.cc
         db/wide/wide_column_serialization.cc
         db/wide/wide_columns.cc
         db/wide/wide_columns_helper.cc
@@ -838,6 +888,7 @@ set(SOURCES
         table/block_based/block_based_table_builder.cc
         table/block_based/block_based_table_factory.cc
         table/block_based/block_based_table_iterator.cc
+        table/block_based/multi_scan_index_iterator.cc
         table/block_based/block_based_table_reader.cc
         table/block_based/block_builder.cc
         table/block_based/block_cache.cc
@@ -914,6 +965,7 @@ set(SOURCES
         util/data_structure.cc
         util/dynamic_bloom.cc
         util/hash.cc
+        util/io_dispatcher_imp.cc
         util/murmurhash.cc
         util/random.cc
         util/rate_limiter.cc
@@ -943,6 +995,7 @@ set(SOURCES
         utilities/cassandra/merge_operator.cc
         utilities/checkpoint/checkpoint_impl.cc
         utilities/compaction_filters.cc
+        utilities/sorted_run_builder/sorted_run_builder.cc
         utilities/compaction_filters/remove_emptyvalue_compactionfilter.cc
         utilities/counted_fs.cc
         utilities/debug.cc
@@ -994,6 +1047,9 @@ set(SOURCES
         utilities/transactions/write_prepared_txn_db.cc
         utilities/transactions/write_unprepared_txn.cc
         utilities/transactions/write_unprepared_txn_db.cc
+        utilities/trie_index/bitvector.cc
+        utilities/trie_index/louds_trie.cc
+        utilities/trie_index/trie_index_factory.cc
         utilities/types_util.cc
         utilities/ttl/db_ttl_impl.cc
         utilities/wal_filter.cc
@@ -1109,8 +1165,23 @@ if(USE_FOLLY_LITE)
   FMT_INCLUDE_DIR)
   include_directories(${FMT_INCLUDE_DIR})
 
+  exec_program(python3 ${PROJECT_SOURCE_DIR}/third-party/folly ARGS
+  build/fbcode_builder/getdeps.py show-inst-dir glog OUTPUT_VARIABLE
+  GLOG_INST_PATH)
+  if(EXISTS ${GLOG_INST_PATH}/lib64)
+    set(GLOG_LIB_DIR ${GLOG_INST_PATH}/lib64)
+  else()
+    set(GLOG_LIB_DIR ${GLOG_INST_PATH}/lib)
+  endif()
+
   add_definitions(-DUSE_FOLLY -DFOLLY_NO_CONFIG)
-  list(APPEND THIRDPARTY_LIBS glog)
+  find_library(GLOG_LIBRARY NAMES glog PATHS ${GLOG_LIB_DIR} NO_DEFAULT_PATH)
+  if(NOT GLOG_LIBRARY)
+    find_library(GLOG_LIBRARY NAMES glog)
+  endif()
+  if(GLOG_LIBRARY)
+    list(APPEND THIRDPARTY_LIBS ${GLOG_LIBRARY})
+  endif()
 endif()
 
 set(ROCKSDB_STATIC_LIB rocksdb${ARTIFACT_SUFFIX})
@@ -1356,6 +1427,7 @@ if(WITH_TESTS)
         db/blob/blob_garbage_meter_test.cc
         db/blob/blob_source_test.cc
         db/blob/db_blob_basic_test.cc
+        db/blob/db_blob_direct_write_test.cc
         db/blob/db_blob_compaction_test.cc
         db/blob/db_blob_corruption_test.cc
         db/blob/db_blob_index_test.cc
@@ -1377,6 +1449,7 @@ if(WITH_TESTS)
         db/db_bloom_filter_test.cc
         db/db_compaction_filter_test.cc
         db/db_compaction_test.cc
+        db/db_compaction_abort_test.cc
         db/db_clip_test.cc
         db/db_dynamic_level_test.cc
         db/db_encryption_test.cc
@@ -1392,6 +1465,7 @@ if(WITH_TESTS)
         db/db_memtable_test.cc
         db/db_merge_operator_test.cc
         db/db_merge_operand_test.cc
+        db/db_open_with_config_test.cc
         db/db_options_test.cc
         db/db_properties_test.cc
         db/db_range_del_test.cc
@@ -1444,6 +1518,7 @@ if(WITH_TESTS)
         db/wal_manager_test.cc
         db/wal_edit_test.cc
         db/wide/db_wide_basic_test.cc
+        db/wide/db_wide_blob_direct_write_test.cc
         db/wide/wide_column_serialization_test.cc
         db/wide/wide_columns_helper_test.cc
         db/write_batch_test.cc
@@ -1524,7 +1599,9 @@ if(WITH_TESTS)
         utilities/cassandra/cassandra_row_merge_test.cc
         utilities/cassandra/cassandra_serialize_test.cc
         utilities/checkpoint/checkpoint_test.cc
+        utilities/sorted_run_builder/sorted_run_builder_test.cc
         utilities/env_timed_test.cc
+        utilities/fault_injection_fs_test.cc
         utilities/memory/memory_test.cc
         utilities/merge_operators/string_append/stringappend_test.cc
         utilities/object_registry_test.cc
@@ -1542,9 +1619,12 @@ if(WITH_TESTS)
         utilities/transactions/lock/point/point_lock_manager_stress_test.cc
         utilities/transactions/write_committed_transaction_ts_test.cc
         utilities/transactions/write_prepared_transaction_test.cc
+        utilities/transactions/write_prepared_transaction_seqno_test.cc
         utilities/transactions/write_unprepared_transaction_test.cc
         utilities/transactions/lock/range/range_locking_test.cc
         utilities/transactions/timestamped_snapshot_test.cc
+        utilities/trie_index/trie_index_db_test.cc
+        utilities/trie_index/trie_index_test.cc
         utilities/ttl/ttl_test.cc
         utilities/types_util_test.cc
         utilities/util_merge_operators_test.cc

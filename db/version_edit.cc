@@ -11,6 +11,7 @@
 
 #include "db/blob/blob_index.h"
 #include "db/version_set.h"
+#include "db/wide/wide_column_serialization.h"
 #include "logging/event_logger.h"
 #include "rocksdb/slice.h"
 #include "table/unique_id_impl.h"
@@ -22,6 +23,40 @@ namespace ROCKSDB_NAMESPACE {
 
 namespace {}  // anonymous namespace
 
+// After copying, we rely on the caller to ensure no double releases. Fragile,
+// but keeps copying cheap.
+PinnedTableReader& PinnedTableReader::operator=(
+    const PinnedTableReader& other) {
+  TableReader* r = other.reader_.load(std::memory_order_acquire);
+  // Only read handle_ when reader_ is non-null. Pin() writes handle_ before
+  // reader_ (with release), so a non-null reader_ guarantees handle_ is stable.
+  // If reader_ is null, Pin() may be in progress — avoid reading handle_.
+  handle_ = (r != nullptr) ? other.handle_ : nullptr;
+  reader_.store(r, std::memory_order_release);
+  return *this;
+}
+
+Cache::Handle* PinnedTableReader::GetCacheHandle() const {
+  (void)reader_.load(std::memory_order_acquire);
+  return handle_;
+}
+
+void PinnedTableReader::Pin(Cache::Handle* handle, TableReader* reader) {
+  assert(handle != nullptr);
+  assert(reader != nullptr);
+  handle_ = handle;
+  reader_.store(reader, std::memory_order_release);
+}
+
+void PinnedTableReader::Release(Cache* cache) {
+  (void)reader_.load(std::memory_order_acquire);
+  if (handle_ != nullptr) {
+    cache->Release(handle_);
+    handle_ = nullptr;
+    reader_.store(nullptr, std::memory_order_relaxed);
+  }
+}
+
 uint64_t PackFileNumberAndPathId(uint64_t number, uint64_t path_id) {
   assert(number <= kFileNumberMask);
   return number | (path_id * (kFileNumberMask + 1));
@@ -30,13 +65,8 @@ uint64_t PackFileNumberAndPathId(uint64_t number, uint64_t path_id) {
 Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
                                       SequenceNumber seqno,
                                       ValueType value_type) {
-  if (value_type == kTypeBlobIndex) {
-    BlobIndex blob_index;
-    const Status s = blob_index.DecodeFrom(value);
-    if (!s.ok()) {
-      return s;
-    }
-
+  // Helper: update oldest_blob_file_number from a single BlobIndex.
+  auto update_oldest_blob = [&](const BlobIndex& blob_index) -> Status {
     if (!blob_index.IsInlined() && !blob_index.HasTTL()) {
       if (blob_index.file_number() == kInvalidBlobFileNumber) {
         return Status::Corruption("Invalid blob file number");
@@ -46,6 +76,24 @@ Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
           oldest_blob_file_number > blob_index.file_number()) {
         oldest_blob_file_number = blob_index.file_number();
       }
+    }
+    return Status::OK();
+  };
+
+  if (value_type == kTypeBlobIndex) {
+    BlobIndex blob_index;
+    if (Status s = blob_index.DecodeFrom(value); !s.ok()) {
+      return s;
+    }
+
+    if (Status s = update_oldest_blob(blob_index); !s.ok()) {
+      return s;
+    }
+  } else if (value_type == kTypeWideColumnEntity) {
+    if (Status s = WideColumnSerialization::ForEachBlobFileNumber(
+            value, update_oldest_blob);
+        !s.ok()) {
+      return s;
     }
   }
 
@@ -83,7 +131,7 @@ bool VersionEdit::EncodeTo(std::string* dst,
     PutVarint32Varint64(dst, kNextFileNumber, next_file_number_);
   }
   if (has_max_column_family_) {
-    PutVarint32Varint32(dst, kMaxColumnFamily, max_column_family_);
+    PutVarint32(dst, kMaxColumnFamily, max_column_family_);
   }
   if (has_min_log_number_to_keep_) {
     PutVarint32Varint64(dst, kMinLogNumberToKeep, min_log_number_to_keep_);
@@ -143,7 +191,7 @@ bool VersionEdit::EncodeTo(std::string* dst,
 
   // 0 is default and does not need to be explicitly written
   if (column_family_ != 0) {
-    PutVarint32Varint32(dst, kColumnFamily, column_family_);
+    PutVarint32(dst, kColumnFamily, column_family_);
   }
 
   if (is_column_family_add_) {
@@ -304,6 +352,19 @@ void VersionEdit::EncodeToNewFile4(const FileMetaData& f, int level,
     char p = static_cast<char>(0);
     PutLengthPrefixedSlice(dst, Slice(&p, 1));
   }
+  // Encode min/max timestamp if they are non-empty
+  if (!f.min_timestamp.empty()) {
+    PutVarint32(dst, NewFileCustomTag::kMinTimestamp);
+    PutLengthPrefixedSlice(dst, Slice(f.min_timestamp));
+  }
+  if (!f.max_timestamp.empty()) {
+    PutVarint32(dst, NewFileCustomTag::kMaxTimestamp);
+    PutLengthPrefixedSlice(dst, Slice(f.max_timestamp));
+  }
+  if (!f.file_open_metadata.empty()) {
+    PutVarint32(dst, NewFileCustomTag::kFileOpenMetadata);
+    PutLengthPrefixedSlice(dst, Slice(f.file_open_metadata));
+  }
   TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
                            dst);
 
@@ -442,6 +503,15 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input, int& max_level,
             return "user-defined timestamps persisted field wrong size";
           }
           f.user_defined_timestamps_persisted = (field[0] == 1);
+          break;
+        case kMinTimestamp:
+          f.min_timestamp = field.ToString();
+          break;
+        case kMaxTimestamp:
+          f.max_timestamp = field.ToString();
+          break;
+        case kFileOpenMetadata:
+          f.file_open_metadata = field.ToString();
           break;
         default:
           if ((custom_tag & kCustomTagNonSafeIgnoreMask) != 0) {
@@ -935,6 +1005,10 @@ std::string VersionEdit::DebugString(bool hex_key) const {
     AppendNumberTo(&r, f.tail_size);
     r.append(" User-defined timestamps persisted: ");
     r.append(f.user_defined_timestamps_persisted ? "true" : "false");
+    if (!f.file_open_metadata.empty()) {
+      r.append(" file_open_metadata_size: ");
+      AppendNumberTo(&r, f.file_open_metadata.size());
+    }
   }
 
   for (const auto& blob_file_addition : blob_file_additions_) {
@@ -1057,6 +1131,9 @@ std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
       jw << "TailSize" << f.tail_size;
       jw << "UserDefinedTimestampsPersisted"
          << f.user_defined_timestamps_persisted;
+      if (!f.file_open_metadata.empty()) {
+        jw << "FileOpenMetadataSize" << f.file_open_metadata.size();
+      }
       jw.EndArrayedObject();
     }
 

@@ -260,6 +260,10 @@ class DBImpl : public DB {
       const WriteOptions& options,
       std::shared_ptr<WriteBatchWithIndex> wbwi) override;
 
+  // Returns true if any live column family currently has blob direct write
+  // enabled.
+  bool HasAnyBlobDirectWriteColumnFamily();
+
   using DB::Get;
   Status Get(const ReadOptions& _read_options,
              ColumnFamilyHandle* column_family, const Slice& key,
@@ -455,19 +459,20 @@ class DBImpl : public DB {
 
   void EnableManualCompaction() override;
   void DisableManualCompaction() override;
+  void AbortAllCompactions() override;
+  void ResumeAllCompactions() override;
 
   using DB::SetOptions;
   Status SetOptions(
-      ColumnFamilyHandle* column_family,
-      const std::unordered_map<std::string, std::string>& options_map) override;
+      const std::unordered_map<ColumnFamilyHandle*,
+                               std::unordered_map<std::string, std::string>>&
+          column_families_opts_map) override;
 
   Status SetDBOptions(
       const std::unordered_map<std::string, std::string>& options_map) override;
 
   using DB::NumberLevels;
   int NumberLevels(ColumnFamilyHandle* column_family) override;
-  using DB::MaxMemCompactionLevel;
-  int MaxMemCompactionLevel(ColumnFamilyHandle* column_family) override;
   using DB::Level0StopWriteTrigger;
   int Level0StopWriteTrigger(ColumnFamilyHandle* column_family) override;
   const std::string& GetName() const override;
@@ -1247,6 +1252,7 @@ class DBImpl : public DB {
 
   int TEST_BGCompactionsAllowed() const;
   int TEST_BGFlushesAllowed() const;
+  int TEST_NumRunningBottomCompactions() const;
   size_t TEST_GetWalPreallocateBlockSize(uint64_t write_buffer_size) const;
   void TEST_WaitForPeriodicTaskRun(std::function<void()> callback) const;
   SeqnoToTimeMapping TEST_GetSeqnoToTimeMapping() const;
@@ -1529,7 +1535,7 @@ class DBImpl : public DB {
   Status FlushAllColumnFamilies(const FlushOptions& flush_options,
                                 FlushReason flush_reason);
 
-  virtual Status FlushForGetLiveFiles();
+  virtual Status FlushForGetLiveFiles(bool force_atomic_flush = false);
 
   void NewThreadStatusCfInfo(ColumnFamilyData* cfd) const;
 
@@ -1549,10 +1555,17 @@ class DBImpl : public DB {
   // @param memtable_updated Whether the same write that ingests wbwi has
   // updated memtable. This is useful for determining whether to set bg
   // error when IngestWBWIAsMemtable fails.
+  // @param ingest_wbwi_for_commit Whether wbwi ingestion is publishing the
+  // committed data of a prepared transaction. This means a failure can leave
+  // committed data durable in WAL but not published in memtables.
+  // @param ignore_missing_cf If true, skip column families not found in the DB
+  // instead of returning an error.
   Status IngestWBWIAsMemtable(std::shared_ptr<WriteBatchWithIndex> wbwi,
                               const WBWIMemTable::SeqnoRange& assigned_seqno,
                               uint64_t min_prep_log, SequenceNumber last_seqno,
-                              bool memtable_updated, bool ignore_missing_cf);
+                              bool memtable_updated,
+                              bool ingest_wbwi_for_commit,
+                              bool ignore_missing_cf);
 
   // If disable_memtable is set the application logic must guarantee that the
   // batch will still be skipped from memtable during the recovery. An excption
@@ -1575,21 +1588,131 @@ class DBImpl : public DB {
   // See more in comment above PreReleaseCallback::Callback().
   // post_memtable_callback is called after memtable write but before publishing
   // the sequence number to readers.
+  // `trace_batch_override`, when non-null, supplies the logical batch to trace
+  // instead of `updates`. Fast paths may rewrite or rebuild `updates` before
+  // apply, but tracing should still record the original user-visible batch.
+  // `skip_blob_direct_write_transform` indicates the caller has already
+  // performed any needed batch-level blob direct-write preprocessing.
+  // `deferred_put_entities`, when non-null, carries structured `PutEntity()`
+  // ops that should be materialized into `updates` after `PreprocessWrite()`
+  // has selected the target memtable/blob generation.
   //
   // The main write queue. This is the only write queue that updates
   // LastSequence. When using one write queue, the same sequence also indicates
   // the last published sequence.
-  Status WriteImpl(const WriteOptions& options, WriteBatch* updates,
-                   WriteCallback* callback = nullptr,
-                   UserWriteCallback* user_write_cb = nullptr,
-                   uint64_t* wal_used = nullptr, uint64_t log_ref = 0,
-                   bool disable_memtable = false, uint64_t* seq_used = nullptr,
-                   size_t batch_cnt = 0,
-                   PreReleaseCallback* pre_release_callback = nullptr,
-                   PostMemTableCallback* post_memtable_callback = nullptr,
-                   std::shared_ptr<WriteBatchWithIndex> wbwi = nullptr);
+  struct DeferredPutEntityBatch;
+  Status WriteImpl(
+      const WriteOptions& options, WriteBatch* updates,
+      WriteCallback* callback = nullptr,
+      UserWriteCallback* user_write_cb = nullptr, uint64_t* wal_used = nullptr,
+      uint64_t log_ref = 0, bool disable_memtable = false,
+      uint64_t* seq_used = nullptr, size_t batch_cnt = 0,
+      PreReleaseCallback* pre_release_callback = nullptr,
+      PostMemTableCallback* post_memtable_callback = nullptr,
+      std::shared_ptr<WriteBatchWithIndex> wbwi = nullptr,
+      WriteBatch* trace_batch_override = nullptr,
+      bool skip_blob_direct_write_transform = false,
+      const DeferredPutEntityBatch* deferred_put_entities = nullptr);
+
+  // Per-WriteImpl state that keeps BDW column families pinned through
+  // referenced SuperVersions until the transformed write either commits or
+  // rolls back.
+  struct BlobDirectWriteContext;
+  // High-level `PutEntity()` fast-path flow:
+  //
+  //   non-BDW target CF:
+  //     PutEntityFastPath()
+  //       -> AppendPreprocessedPutEntityToBatch()
+  //       -> WritePreprocessedPutEntityBatch()
+  //       -> WriteImpl(skip_blob_direct_write_transform = true)
+  //
+  //   BDW-enabled target CF:
+  //     PutEntityFastPath()
+  //       -> sort columns and stash DeferredPutEntityBatch::Op
+  //       -> WritePreprocessedPutEntityBatch()
+  //       -> WriteImpl(..., deferred_put_entities)
+  //       -> after PreprocessWrite() picks the memtable/blob generation:
+  //            AppendSortedPutEntityToBatch()
+  //
+  // The BDW branch defers final serialization until `WriteImpl()` knows the
+  // target memtable/blob generation, avoiding the old
+  // serialize -> deserialize -> serialize cycle on the write hot path.
+  // Staging buffer for the `PutEntity()` fast path when blob direct write may
+  // need to rewrite wide-column values. `PutEntityFastPath()` records the
+  // logical operations here instead of serializing them into a `WriteBatch`
+  // immediately, then passes this struct to `WriteImpl()`. Once
+  // `PreprocessWrite()` has selected the memtable/blob-file generation,
+  // `WriteImpl()` materializes each op directly into the final batch with blob
+  // direct-write preprocessing applied. This avoids the old
+  // serialize-deserialize-serialize cycle on the write hot path.
+  struct DeferredPutEntityBatch {
+    // The fast path sorts columns up front so `WriteImpl()` can append the
+    // final serialized entity without redoing that work.
+    struct Op {
+      // Target column family for the logical `PutEntity()` op.
+      uint32_t column_family_id = 0;
+      // Owned key bytes kept alive until `WriteImpl()` rebuilds the batch.
+      std::string key;
+      // Pre-sorted columns ready for final serialization and blob
+      // direct-write preprocessing.
+      WideColumns sorted_columns;
+    };
+
+    // Logical `PutEntity()` ops collected by the fast path and replayed into
+    // the final `WriteBatch` inside `WriteImpl()`.
+    std::vector<Op> ops;
+  };
+  // Rewrites a write batch for blob direct write when the current DB and batch
+  // shape are compatible, recording touched managers and rollback metadata in
+  // `blob_direct_write_ctx`.
+  Status MaybeTransformBatchForBlobDirectWrite(
+      const WriteOptions& write_options, WriteBatch** batch,
+      bool should_write_to_memtable, bool lookup_from_write_thread,
+      WriteBatch* transformed_storage,
+      BlobDirectWriteContext* blob_direct_write_ctx);
+  // Sorts and preprocesses one `PutEntity()` op, then appends the final
+  // serialized form to `batch`.
+  Status AppendPreprocessedPutEntityToBatch(
+      const WriteOptions& write_options, WriteBatch* batch,
+      ColumnFamilyHandle* column_family, const Slice& key,
+      const WideColumns& columns,
+      BlobDirectWriteContext* blob_direct_write_ctx);
+  // Appends a `PutEntity()` op whose columns are already sorted, allowing the
+  // fast path to avoid re-sorting before final serialization.
+  Status AppendSortedPutEntityToBatch(
+      const WriteOptions& write_options, WriteBatch* batch,
+      uint32_t column_family_id, const Slice& key,
+      const WideColumns& sorted_columns,
+      BlobDirectWriteContext* blob_direct_write_ctx);
+  // Specialized `PutEntity()` write path for a single column family. This
+  // avoids building an intermediate serialized entity when blob direct write
+  // needs to rewrite the final batch inside `WriteImpl()`.
+  Status PutEntityFastPath(const WriteOptions& write_options,
+                           ColumnFamilyHandle* column_family, const Slice& key,
+                           const WideColumns& columns);
+  // Specialized `PutEntity(AttributeGroups)` path that defers final batch
+  // materialization until `WriteImpl()` when any target CF may use blob direct
+  // write.
+  Status PutEntityFastPath(const WriteOptions& write_options, const Slice& key,
+                           const AttributeGroups& attribute_groups);
+  // Writes a batch prepared by the `PutEntity()` fast path. When
+  // `deferred_put_entities` is present, `WriteImpl()` rebuilds `batch`
+  // internally after `PreprocessWrite()` and disables normal write batching to
+  // keep the staging state local to this write. `trace_batch` stays separate
+  // so tracing can still emit the logical `PutEntity()` batch even when the
+  // applied batch is materialized later inside `WriteImpl()`.
+  Status WritePreprocessedPutEntityBatch(
+      const WriteOptions& write_options, WriteBatch* batch,
+      WriteBatch* trace_batch,
+      const DeferredPutEntityBatch* deferred_put_entities = nullptr);
+  // Flushes or syncs all blob direct-write managers touched by the current
+  // transformed write before the write can proceed.
+  Status SyncBlobDirectWriteManagers(
+      const WriteOptions& write_options,
+      const BlobDirectWriteContext& blob_direct_write_ctx);
 
   Status PipelinedWriteImpl(const WriteOptions& options, WriteBatch* updates,
+                            WriteBatch* trace_batch,
                             WriteCallback* callback = nullptr,
                             UserWriteCallback* user_write_cb = nullptr,
                             uint64_t* wal_used = nullptr, uint64_t log_ref = 0,
@@ -1618,7 +1741,7 @@ class DBImpl : public DB {
   // marks start of a new sub-batch.
   Status WriteImplWALOnly(
       WriteThread* write_thread, const WriteOptions& options,
-      WriteBatch* updates, WriteCallback* callback,
+      WriteBatch* updates, WriteBatch* trace_batch, WriteCallback* callback,
       UserWriteCallback* user_write_cb, uint64_t* wal_used,
       const uint64_t log_ref, uint64_t* seq_used, const size_t sub_batch_cnt,
       PreReleaseCallback* pre_release_callback, const AssignOrder assign_order,
@@ -1698,6 +1821,9 @@ class DBImpl : public DB {
   Status FailIfCfHasTs(const ColumnFamilyHandle* column_family) const;
   Status FailIfTsMismatchCf(ColumnFamilyHandle* column_family,
                             const Slice& ts) const;
+  Status FailIfTableFilterWithRangeConversion(
+      const ReadOptions& read_options,
+      const MutableCFOptions& mutable_cf_options) const;
 
   // Check that the read timestamp `ts` is at or above the `full_history_ts_low`
   // timestamp in a `SuperVersion`. It's necessary to do this check after
@@ -1717,6 +1843,17 @@ class DBImpl : public DB {
   // recovery.
   Status LogAndApplyForRecovery(const RecoveryContext& recovery_ctx);
 
+  // Schedule background work to open and validate SST files asynchronously.
+  // Called when open_files_async is enabled.
+  void ScheduleAsyncFileOpening();
+
+  // Mark async file opening as not needed. Used by subclasses that load
+  // table files through a different mechanism (e.g., ReactiveVersionSet).
+  void MarkAsyncFileOpenNotNeeded();
+
+  // Background work function for async file opening.
+  static void BGWorkAsyncFileOpen(void* arg);
+
   void InvokeWalFilterIfNeededOnColumnFamilyToWalNumberMap();
 
   // Return true to proceed with current WAL record whose content is stored in
@@ -1727,8 +1864,12 @@ class DBImpl : public DB {
                                           Status& status, bool& stop_replay,
                                           WriteBatch& batch);
 
+  // Indicate DB was opened successfully
+  bool opened_successfully_ = false;
+
  private:
   friend class DB;
+  friend class DBImplSecondary;
   friend class ErrorHandler;
   friend class InternalStats;
   friend class PessimisticTransaction;
@@ -1760,6 +1901,21 @@ class DBImpl : public DB {
   friend class CompactionServiceTest_PreservedOptionsLocalCompaction_Test;
   friend class CompactionServiceTest_PreservedOptionsRemoteCompaction_Test;
 #endif
+
+  // Same as HasAnyBlobDirectWriteColumnFamily(), but requires `mutex_` held.
+  bool HasAnyBlobDirectWriteColumnFamilyWithLockHeld();
+  // Returns true if any BDW column family still owns blob files that have not
+  // yet been made visible through MANIFEST. Requires `mutex_` held.
+  bool HasInFlightBlobDirectWriteFilesWithLockHeld();
+  // Creates and attaches the per-CF blob direct-write partition manager when
+  // the column family is opened with the feature enabled.
+  void MaybeInitBlobDirectWriteColumnFamily(
+      ColumnFamilyData* cfd, const ColumnFamilyOptions& cf_options,
+      const std::string& column_family_name);
+  // Increments the DB-level count of live blob direct-write column families.
+  void RegisterBlobDirectWriteColumnFamily();
+  // Decrements the DB-level count of live blob direct-write column families.
+  void UnregisterBlobDirectWriteColumnFamily();
 
   struct CompactionState;
   struct PrepickedCompaction;
@@ -1898,11 +2054,12 @@ class DBImpl : public DB {
           flush_reason_(FlushReason::kOthers) {}
     BGFlushArg(ColumnFamilyData* cfd, uint64_t max_memtable_id,
                SuperVersionContext* superversion_context,
-               FlushReason flush_reason)
+               FlushReason flush_reason, bool atomic_flush)
         : cfd_(cfd),
           max_memtable_id_(max_memtable_id),
           superversion_context_(superversion_context),
-          flush_reason_(flush_reason) {}
+          flush_reason_(flush_reason),
+          atomic_flush_(atomic_flush) {}
 
     // Column family to flush.
     ColumnFamilyData* cfd_;
@@ -1914,6 +2071,8 @@ class DBImpl : public DB {
     // requires a SuperVersionContext object (currently embedded in JobContext).
     SuperVersionContext* superversion_context_;
     FlushReason flush_reason_;
+    // Whether this flush should use atomic flush code path.
+    bool atomic_flush_ = false;
   };
 
   // Argument passed to flush thread.
@@ -2033,6 +2192,10 @@ class DBImpl : public DB {
   void DeleteObsoleteFileImpl(int job_id, const std::string& fname,
                               const std::string& path_to_sync, FileType type,
                               uint64_t number);
+  // Returns true when a blob file must be preserved because it is still
+  // tracked by blob direct write or is still footer-less on disk.
+  bool ShouldKeepBlobFileDuringPurge(uint64_t number,
+                                     const std::string& blob_file_path);
 
   // Background process needs to call
   //     auto x = CaptureCurrentFileNumberInPendingOutputs()
@@ -2149,7 +2312,7 @@ class DBImpl : public DB {
   Status InsertLogRecordToMemtable(WriteBatch* batch_to_use,
                                    uint64_t wal_number,
                                    SequenceNumber* next_sequence,
-                                   bool* has_valid_writes);
+                                   bool* has_valid_writes, bool read_only);
 
   Status MaybeWriteLevel0TableForRecovery(
       bool has_valid_writes, bool read_only, uint64_t wal_number, int job_id,
@@ -2415,8 +2578,13 @@ class DBImpl : public DB {
 
   void MaybeScheduleFlushOrCompaction();
 
+  BackgroundJobPressure CaptureBackgroundJobPressure() const;
+  void NotifyOnBackgroundJobPressureChanged();
+
   struct FlushRequest {
     FlushReason flush_reason;
+    // Whether this flush request should use the atomic flush code path.
+    bool atomic_flush = false;
     // A map from column family to flush to largest memtable id to persist for
     // each column family. Once all the memtables whose IDs are smaller than or
     // equal to this per-column-family specified value, this flush request is
@@ -2504,6 +2672,13 @@ class DBImpl : public DB {
 
   // Schedule background tasks
   Status StartPeriodicTaskScheduler();
+
+  // Compute the repeat period for the kTriggerCompaction task, which ensures
+  // compactions not dependent on writes (flushes) are eventually triggered when
+  // there are no writes (flushes). NOT thread safe; only called during DB open
+  // (StartPeriodicTaskScheduler). KNOWN LIMITATION: doesn't get updated with
+  // dynamic option updates. (Probably not worth the extra complexity.)
+  uint64_t ComputeTriggerCompactionPeriod();
 
   // Cancel scheduled periodic tasks
   Status CancelPeriodicTaskScheduler();
@@ -2745,6 +2920,30 @@ class DBImpl : public DB {
                                       std::string ts_low);
 
   bool ShouldReferenceSuperVersion(const MergeContext& merge_context);
+  // Resolves a plain value whose current payload is an encoded direct-write
+  // blob index, either through `value` directly or through the default-column
+  // view layered on `columns`.
+  static Status ResolveDirectWritePlainValue(const ReadOptions& read_options,
+                                             const Slice& key,
+                                             const Version* current,
+                                             ColumnFamilyData* cfd,
+                                             PinnableSlice* value,
+                                             PinnableWideColumns* columns);
+  // Resolves each unresolved direct-write blob-valued column in `columns` and
+  // rebuilds the serialized wide-column entity in place.
+  static Status ResolveDirectWriteWideColumns(const ReadOptions& read_options,
+                                              const Slice& key,
+                                              const Version* current,
+                                              ColumnFamilyData* cfd,
+                                              PinnableWideColumns* columns);
+  // Dispatches between plain-value and wide-column direct-write resolution for
+  // read results observed before flush makes the corresponding blob file
+  // visible through normal Version metadata.
+  static bool MaybeResolveDirectWriteValue(
+      const ReadOptions& read_options, const Slice& key,
+      bool resolve_direct_write_value, const Version* current,
+      ColumnFamilyData* cfd, PinnableSlice* value, PinnableWideColumns* columns,
+      Status* s, bool* is_blob_index, bool* value_found = nullptr);
 
   template <typename IterType, typename ImplType,
             typename ErrorIteratorFuncType>
@@ -2787,6 +2986,14 @@ class DBImpl : public DB {
   // manual compactions. It is accessed in read mode outside the DB mutex in
   // compaction code paths.
   std::atomic<int> manual_compaction_paused_ = false;
+
+  // If non-zero, all compaction jobs (background automatic compactions,
+  // manual compactions via CompactRange, and foreground CompactFiles calls)
+  // are being aborted. Compactions will be signaled to stop. Any new
+  // compaction job would fail immediately. The value indicates how many threads
+  // have called AbortAllCompactions(). It is accessed in read mode outside the
+  // DB mutex in compaction code paths.
+  std::atomic<int> compaction_aborted_ = 0;
 
   // This condition variable is signaled on these conditions:
   // * whenever bg_compaction_scheduled_ goes down to 0
@@ -3042,6 +3249,9 @@ class DBImpl : public DB {
   // stores the number of compactions are currently running
   int num_running_compactions_ = 0;
 
+  // stores the number of BOTTOM-priority compactions currently running
+  int num_running_bottom_compactions_ = 0;
+
   // number of background memtable flush jobs, submitted to the HIGH pool
   int bg_flush_scheduled_ = 0;
 
@@ -3050,6 +3260,19 @@ class DBImpl : public DB {
 
   // number of background obsolete file purge jobs, submitted to the HIGH pool
   int bg_purge_scheduled_ = 0;
+
+  // number of pressure callbacks currently in progress (for destructor safety)
+  int bg_pressure_callback_in_progress_ = 0;
+
+  enum class AsyncFileOpenState : uint8_t {
+    kNotScheduled = 0,  // Async file opening has not been scheduled.
+    kScheduled,         // Async file opening is in-flight in the HIGH pool.
+    kComplete,          // Async file opening has finished (or was not needed).
+  };
+
+  // Tracks whether background async file opening has been scheduled/completed.
+  AsyncFileOpenState bg_async_file_open_state_ =
+      AsyncFileOpenState::kNotScheduled;
 
   std::deque<ManualCompactionState*> manual_compaction_dequeue_;
 
@@ -3082,6 +3305,11 @@ class DBImpl : public DB {
   // Used when disableWAL is true.
   std::atomic<bool> has_unpersisted_data_{false};
 
+  // Number of live column families with an active blob direct write partition
+  // manager. This keeps the read/write fast paths at O(1) when the feature is
+  // completely disabled for the DB.
+  std::atomic<uint32_t> blob_direct_write_cf_count_{0};
+
   // if an attempt was made to flush all column families that
   // the oldest log depends on but uncommitted data in the oldest
   // log prevents the log from being released.
@@ -3105,9 +3333,6 @@ class DBImpl : public DB {
 
   // Guard against multiple concurrent refitting
   bool refitting_level_ = false;
-
-  // Indicate DB was opened successfully
-  bool opened_successfully_ = false;
 
   // The min threshold to triggere bottommost compaction for removing
   // garbages, among all column families.
@@ -3176,7 +3401,7 @@ class DBImpl : public DB {
   // installed to MANIFEST first.
   InstrumentedCondVar atomic_flush_install_cv_;
 
-  bool wal_in_db_path_;
+  bool wal_in_db_path_ = false;
   std::atomic<uint64_t> max_total_wal_size_;
 
   BlobFileCompletionCallback blob_callback_;
@@ -3309,6 +3534,18 @@ inline Status DBImpl::FailIfTsMismatchCf(ColumnFamilyHandle* column_family,
     oss << "Timestamp sizes mismatch: expect " << ucmp->timestamp_size() << ", "
         << ts_sz << " given";
     return Status::InvalidArgument(oss.str());
+  }
+  return Status::OK();
+}
+
+inline Status DBImpl::FailIfTableFilterWithRangeConversion(
+    const ReadOptions& read_options,
+    const MutableCFOptions& mutable_cf_options) const {
+  if (read_options.table_filter &&
+      mutable_cf_options.min_tombstones_for_range_conversion > 0) {
+    return Status::InvalidArgument(
+        "ReadOptions::table_filter is not supported when "
+        "min_tombstones_for_range_conversion > 0");
   }
   return Status::OK();
 }

@@ -390,8 +390,6 @@ ifdef COMPILE_WITH_TSAN
         # Turn off -pg when enabling TSAN testing, because that induces
         # a link failure.  TODO: find the root cause
 	PROFILING_FLAGS =
-	# LUA is not supported under TSAN
-	LUA_PATH =
 	# Limit keys for crash test under TSAN to avoid error:
 	# "ThreadSanitizer: DenseSlabAllocator overflow. Dying."
 	CRASH_TEST_EXT_ARGS += --max_key=1000000
@@ -452,7 +450,7 @@ ifndef USE_FOLLY
 endif
 
 ifndef GTEST_THROW_ON_FAILURE
-	export GTEST_THROW_ON_FAILURE=1
+	export GTEST_THROW_ON_FAILURE=0
 endif
 ifndef GTEST_HAS_EXCEPTIONS
 	export GTEST_HAS_EXCEPTIONS=1
@@ -507,32 +505,6 @@ ifndef DISABLE_WARNING_AS_ERROR
 	WARNING_FLAGS += -Werror
 endif
 
-
-ifdef LUA_PATH
-
-ifndef LUA_INCLUDE
-LUA_INCLUDE=$(LUA_PATH)/include
-endif
-
-LUA_INCLUDE_FILE=$(LUA_INCLUDE)/lualib.h
-
-ifeq ("$(wildcard $(LUA_INCLUDE_FILE))", "")
-# LUA_INCLUDE_FILE does not exist
-$(error Cannot find lualib.h under $(LUA_INCLUDE).  Try to specify both LUA_PATH and LUA_INCLUDE manually)
-endif
-LUA_FLAGS = -I$(LUA_INCLUDE) -DLUA -DLUA_COMPAT_ALL
-CFLAGS += $(LUA_FLAGS)
-CXXFLAGS += $(LUA_FLAGS)
-
-ifndef LUA_LIB
-LUA_LIB = $(LUA_PATH)/lib/liblua.a
-endif
-ifeq ("$(wildcard $(LUA_LIB))", "") # LUA_LIB does not exist
-$(error $(LUA_LIB) does not exist.  Try to specify both LUA_PATH and LUA_LIB manually)
-endif
-EXEC_LDFLAGS += $(LUA_LIB)
-
-endif
 
 ifeq ($(NO_THREEWAY_CRC32C), 1)
 	CXXFLAGS += -DNO_THREEWAY_CRC32C
@@ -604,8 +576,8 @@ ifneq ($(filter check-headers, $(MAKECMDGOALS)),)
 # TODO: add/support JNI headers
 	DEV_HEADER_DIRS := $(sort include/ $(dir $(ALL_SOURCES)))
 # Some headers like in port/ are platform-specific
-	DEV_HEADERS_TO_CHECK := $(shell $(FIND) $(DEV_HEADER_DIRS) -type f -name '*.h' | grep -E -v 'port/|plugin/|lua/|range_tree/|secondary_index/')
-	PUBLIC_HEADERS_TO_CHECK := $(shell $(FIND) include/ -type f -name '*.h' | grep -E -v 'lua/')
+	DEV_HEADERS_TO_CHECK := $(shell $(FIND) $(DEV_HEADER_DIRS) -type f -name '*.h' | grep -E -v 'port/|plugin/|range_tree/|secondary_index/')
+	PUBLIC_HEADERS_TO_CHECK := $(shell $(FIND) include/ -type f -name '*.h')
 else
 	DEV_HEADERS_TO_CHECK :=
 	PUBLIC_HEADERS_TO_CHECK :=
@@ -649,25 +621,24 @@ endif
 
 ROCKSDBTESTS_SUBSET ?= $(TESTS)
 
-# c_test - doesn't use gtest
-# env_test - suspicious use of test::TmpDir
-# deletefile_test - serial because it generates giant temporary files in
-#   its various tests. Parallel can fill up your /dev/shm
-# db_bloom_filter_test - serial because excessive space usage by instances
-#   of DBFilterConstructionReserveMemoryTestWithParam can fill up /dev/shm
+# c_test - doesn't use gtest, can't be sharded
+# Other tests previously listed here (backup_engine_test, db_bloom_filter_test,
+# perf_context_test, etc.) were NON_PARALLEL due to /dev/shm memory concerns
+# when the old per-test-case sharding spawned thousands of processes. With the
+# new gtest-based sharding (GTEST_SHARD_SIZE=10, max NCORES*8 shards), at most
+# ~4 shards run concurrently on CI (4 cores), so peak memory is manageable
+# (4 * 1GB = 4GB << 16GB shm).
 NON_PARALLEL_TEST = \
 	c_test \
-	env_test \
-	deletefile_test \
-	db_bloom_filter_test \
 	$(PLUGIN_TESTS) \
 
-PARALLEL_TEST = $(filter-out $(NON_PARALLEL_TEST), $(TESTS))
+PARALLEL_TEST = $(filter-out $(NON_PARALLEL_TEST), $(ROCKSDBTESTS_SUBSET))
 
 # Not necessarily well thought out or up-to-date, but matches old list
 TESTS_PLATFORM_DEPENDENT := \
 	db_basic_test \
 	db_blob_basic_test \
+	db_blob_direct_write_test \
 	db_encryption_test \
 	external_sst_file_basic_test \
 	auto_roll_logger_test \
@@ -675,6 +646,7 @@ TESTS_PLATFORM_DEPENDENT := \
 	dynamic_bloom_test \
 	c_test \
 	checkpoint_test \
+	sorted_run_builder_test \
 	crc32c_test \
 	coding_test \
 	inlineskiplist_test \
@@ -833,9 +805,20 @@ endif  # PLATFORM_SHARED_EXT
 .PHONY: check clean coverage ldb_tests package dbg gen-pc build_size \
 	release tags tags0 valgrind_check format static_lib shared_lib all \
 	rocksdbjavastatic rocksdbjava install install-static install-shared \
-	uninstall analyze tools tools_lib check-headers checkout_folly
+	uninstall analyze tools tools_lib check-headers checkout_folly clang-tidy
 
-all: $(LIBRARY) $(BENCHMARKS) tools tools_lib test_libs $(TESTS)
+# Auto-configure git hooks on first build so developers do not need to run
+# "make install-hooks" manually. This is a no-op if already set.
+setup-hooks:
+	@if [ -d .git ] && [ -d githooks ]; then \
+		cur=$$(git config core.hooksPath 2>/dev/null); \
+		if [ "$$cur" != "githooks" ]; then \
+			git config core.hooksPath githooks; \
+			echo "git hooks: configured core.hooksPath = githooks"; \
+		fi; \
+	fi
+
+all: setup-hooks $(LIBRARY) $(BENCHMARKS) tools tools_lib test_libs $(TESTS)
 
 all_but_some_tests: $(LIBRARY) $(BENCHMARKS) tools tools_lib test_libs $(ROCKSDBTESTS_SUBSET)
 
@@ -899,21 +882,42 @@ coverage: clean
 
 parallel_tests = $(patsubst %,parallel_%,$(PARALLEL_TEST))
 .PHONY: gen_parallel_tests $(parallel_tests)
+# Shard size controls how many test cases run per process. The actual number
+# of shards per binary is: min(ceil(test_count / GTEST_SHARD_SIZE), NCORES * 8)
+# This adapts to machine size: many small shards on beefy machines, fewer
+# larger shards on CI (typically 2-4 cores).
+GTEST_SHARD_SIZE ?= 10
+NCORES ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+
 $(parallel_tests):
 	$(AM_V_at)TEST_BINARY=$(patsubst parallel_%,%,$@); \
-  TEST_NAMES=` \
-    (./$$TEST_BINARY --gtest_list_tests || echo "  $${TEST_BINARY}__list_tests_failure") \
-    | awk '/^[^ ]/ { prefix = $$1 } /^[ ]/ { print prefix $$1 }'`; \
-	echo "  Generating parallel test scripts for $$TEST_BINARY"; \
-	for TEST_NAME in $$TEST_NAMES; do \
-		TEST_SCRIPT=t/run-$$TEST_BINARY-$${TEST_NAME//\//-}; \
+  TEST_COUNT=` \
+    (./$$TEST_BINARY --gtest_list_tests 2>/dev/null || echo "  list_failure") \
+    | grep -c '^ '`; \
+	if [ "$$TEST_COUNT" -le 0 ]; then TEST_COUNT=1; fi; \
+	MAX_SHARDS=$$(( $(NCORES) * 8 )); \
+	NUM_SHARDS=$$(( (TEST_COUNT + $(GTEST_SHARD_SIZE) - 1) / $(GTEST_SHARD_SIZE) )); \
+	if [ "$$NUM_SHARDS" -gt "$$MAX_SHARDS" ]; then NUM_SHARDS=$$MAX_SHARDS; fi; \
+	if [ "$$NUM_SHARDS" -le 0 ]; then NUM_SHARDS=1; fi; \
+	echo "  Generating $$NUM_SHARDS shards for $$TEST_BINARY ($$TEST_COUNT tests)"; \
+	SHARD_IDX=0; \
+	while [ "$$SHARD_IDX" -lt "$$NUM_SHARDS" ]; do \
+		if [ -n "$(CI_TOTAL_SHARDS)" ] && [ $$(( $$SHARD_IDX % $(CI_TOTAL_SHARDS) )) -ne $(CI_SHARD_INDEX) ]; then \
+			SHARD_IDX=$$((SHARD_IDX + 1)); \
+			continue; \
+		fi; \
+		TEST_SCRIPT=t/run-$$TEST_BINARY-shard-$$SHARD_IDX; \
     printf '%s\n' \
       '#!/bin/sh' \
       "d=\$(TEST_TMPDIR)$$TEST_SCRIPT" \
       'mkdir -p $$d' \
-      "TEST_TMPDIR=\$$d $(DRIVER) ./$$TEST_BINARY --gtest_filter=$$TEST_NAME" \
+      "TEST_TMPDIR=\$$d GTEST_TOTAL_SHARDS=$$NUM_SHARDS GTEST_SHARD_INDEX=$$SHARD_IDX $(DRIVER) ./$$TEST_BINARY" \
+      'test_retcode=$$?' \
+      '[ $$test_retcode -eq 0 ] && rm -rf $$d' \
+      'exit $$test_retcode' \
 		> $$TEST_SCRIPT; \
 		chmod a=rx $$TEST_SCRIPT; \
+		SHARD_IDX=$$((SHARD_IDX + 1)); \
 	done
 
 gen_parallel_tests:
@@ -937,8 +941,10 @@ gen_parallel_tests:
 # 152.120 PASS t/DBTest.FileCreationRandomFailure
 # 107.816 PASS t/DBTest.EncodeDecompressedBlockSizeTest
 #
+# With sharded test execution, prioritize binaries known to be slow.
+# These generate many shards and should start early for good load balancing.
 slow_test_regexp = \
-	^.*MySQLStyleTransactionTest.*$$|^.*SnapshotConcurrentAccessTest.*$$|^.*SeqAdvanceConcurrentTest.*$$|^t/run-table_test-HarnessTest.Randomized$$|^t/run-db_test-.*(?:FileCreationRandomFailure|EncodeDecompressedBlockSizeTest)$$|^.*RecoverFromCorruptedWALWithoutFlush$$
+	^.*block_based_table_reader_test.*$$|^.*table_test.*$$|^.*block_test.*$$|^.*write_prepared_transaction_test.*$$|^.*transaction_test.*$$|^.*external_sst_file_test.*$$|^.*db_wal_test.*$$|^.*db_with_timestamp_basic_test.*$$|^.*db_test-.*$$
 prioritize_long_running_tests =						\
   perl -pe 's,($(slow_test_regexp)),100 $$1,'				\
     | sort -k1,1gr							\
@@ -973,7 +979,13 @@ check_0:
 	  'To monitor subtest <duration,pass/fail,name>,'		\
 	  '  run "make watch-log" in a separate window' '';		\
 	{ \
-		printf './%s\n' $(filter-out $(PARALLEL_TEST),$(TESTS)); \
+		NON_PARALLEL_LIST="$(filter-out $(PARALLEL_TEST),$(ROCKSDBTESTS_SUBSET))"; \
+		if [ -n "$$NON_PARALLEL_LIST" ]; then \
+		  printf './%s\n' $$NON_PARALLEL_LIST \
+		    | if [ -n "$(CI_TOTAL_SHARDS)" ]; then \
+		        awk -v s=$(CI_SHARD_INDEX) -v n=$(CI_TOTAL_SHARDS) '(NR-1)%n==s'; \
+		      else cat; fi; \
+		fi; \
 		find t -name 'run-*' -print; \
 	} \
 	  | $(prioritize_long_running_tests)				\
@@ -1021,9 +1033,19 @@ watch-log:
 dump-log:
 	bash -c '$(quoted_perl_command)' < LOG
 
+# Machine-parseable progress output for automated monitoring (e.g., Claude Code)
+# Outputs JSON: {"status":"running","completed":45,"total":100,"failed":0,"percent":45,"eta_seconds":120}
+check-progress:
+	@build_tools/check_progress.sh
+
 # If J != 1 and GNU parallel is installed, run the tests in parallel,
 # via the check_0 rule above.  Otherwise, run them sequentially.
 check: all
+	$(AM_V_at)echo "Cleaning up stale test directories older than 3 hours..."; \
+	  test_tmpdir_parent=$$(dirname $(TEST_TMPDIR)); \
+	  find $$test_tmpdir_parent -maxdepth 1 -name 'rocksdb.*' -type d \
+	    -mmin +180 -exec rm -rf {} + 2>/dev/null; \
+	  true
 	$(MAKE) gen_parallel_tests
 	$(AM_V_GEN)if test "$(J)" != 1                                  \
 	    && (build_tools/gnu_parallel --gnu --help 2>/dev/null) |                    \
@@ -1039,6 +1061,7 @@ ifneq ($(PLATFORM), OS_AIX)
 	$(PYTHON) tools/check_all_python.py
 ifndef ASSERT_STATUS_CHECKED # not yet working with these tests
 	$(PYTHON) tools/ldb_test.py
+	$(PYTHON) tools/db_crashtest_test.py
 	sh tools/rocksdb_dump_test.sh
 endif
 endif
@@ -1046,6 +1069,7 @@ ifndef SKIP_FORMAT_BUCK_CHECKS
 	$(MAKE) check-format
 	$(MAKE) check-buck-targets
 	$(MAKE) check-sources
+	$(MAKE) check-workflow-yaml
 endif
 
 # TODO add ldb_tests
@@ -1055,6 +1079,10 @@ check_some: $(ROCKSDBTESTS_SUBSET)
 .PHONY: ldb_tests
 ldb_tests: ldb
 	$(PYTHON) tools/ldb_test.py
+
+.PHONY: db_crashtest_tests
+db_crashtest_tests:
+	$(PYTHON) tools/db_crashtest_test.py
 
 include crash_test.mk
 
@@ -1232,14 +1260,55 @@ tags0:
 format:
 	build_tools/format-diff.sh
 
+# Non-interactive format (auto-apply without prompts, for CI/automation/Claude Code)
+format-auto:
+	build_tools/format-diff.sh -y
+
 check-format:
 	build_tools/format-diff.sh -c
+
+
+install-hooks:
+	@echo "Installing git hooks from githooks/..."
+	@if [ -d githooks ]; then \
+		for hook in githooks/*; do \
+			hook_name=$$(basename "$$hook"); \
+			cp "$$hook" .git/hooks/"$$hook_name"; \
+			chmod +x .git/hooks/"$$hook_name"; \
+			echo "  Installed $$hook_name"; \
+		done; \
+		echo "Done. Hooks installed to .git/hooks/"; \
+	else \
+		echo "Error: githooks/ directory not found"; \
+		exit 1; \
+	fi
+
+uninstall-hooks:
+	@echo "Removing installed git hooks..."
+	@for hook in githooks/*; do \
+		hook_name=$$(basename "$$hook"); \
+		rm -f .git/hooks/"$$hook_name"; \
+		echo "  Removed $$hook_name"; \
+	done
+	@echo "Done."
 
 check-buck-targets:
 	buckifier/check_buck_targets.sh
 
 check-sources:
 	build_tools/check-sources.sh
+
+check-workflow-yaml:
+	build_tools/check-workflow-yaml.sh
+
+# Run clang-tidy on locally changed files, filtered to changed lines only.
+# Requires compile_commands.json (generate with cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON).
+# Override CLANG_TIDY_BINARY and CLANG_TIDY_JOBS as needed:
+#   make clang-tidy CLANG_TIDY_BINARY=/usr/bin/clang-tidy CLANG_TIDY_JOBS=8
+CLANG_TIDY_BINARY ?= /opt/homebrew/opt/llvm/bin/clang-tidy
+CLANG_TIDY_JOBS ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+clang-tidy:
+	python3 tools/run_clang_tidy.py --clang-tidy-binary $(CLANG_TIDY_BINARY) -j $(CLANG_TIDY_JOBS)
 
 package:
 	bash build_tools/make_package.sh $(SHARED_MAJOR).$(SHARED_MINOR)
@@ -1419,6 +1488,9 @@ db_basic_test: $(OBJ_DIR)/db/db_basic_test.o $(TEST_LIBRARY) $(LIBRARY)
 db_blob_basic_test: $(OBJ_DIR)/db/blob/db_blob_basic_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+db_blob_direct_write_test: $(OBJ_DIR)/db/blob/db_blob_direct_write_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 db_blob_compaction_test: $(OBJ_DIR)/db/blob/db_blob_compaction_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
@@ -1428,6 +1500,9 @@ db_readonly_with_timestamp_test: $(OBJ_DIR)/db/db_readonly_with_timestamp_test.o
 db_wide_basic_test: $(OBJ_DIR)/db/wide/db_wide_basic_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+db_wide_blob_direct_write_test: $(OBJ_DIR)/db/wide/db_wide_blob_direct_write_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 db_with_timestamp_basic_test: $(OBJ_DIR)/db/db_with_timestamp_basic_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
@@ -1435,6 +1510,9 @@ db_with_timestamp_compaction_test: db/db_with_timestamp_compaction_test.o $(TEST
 	$(AM_LINK)
 
 db_encryption_test: $(OBJ_DIR)/db/db_encryption_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
+db_open_with_config_test: $(OBJ_DIR)/db/db_open_with_config_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
 db_test: $(OBJ_DIR)/db/db_test.o $(TEST_LIBRARY) $(LIBRARY)
@@ -1468,6 +1546,9 @@ db_compaction_filter_test: $(OBJ_DIR)/db/db_compaction_filter_test.o $(TEST_LIBR
 	$(AM_LINK)
 
 db_compaction_test: $(OBJ_DIR)/db/db_compaction_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
+db_compaction_abort_test: $(OBJ_DIR)/db/db_compaction_abort_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
 db_clip_test: $(OBJ_DIR)/db/db_clip_test.o $(TEST_LIBRARY) $(LIBRARY)
@@ -1578,6 +1659,9 @@ backup_engine_test: $(OBJ_DIR)/utilities/backup/backup_engine_test.o $(TEST_LIBR
 checkpoint_test: $(OBJ_DIR)/utilities/checkpoint/checkpoint_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+sorted_run_builder_test: $(OBJ_DIR)/utilities/sorted_run_builder/sorted_run_builder_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 cache_simulator_test: $(OBJ_DIR)/utilities/simulator_cache/cache_simulator_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
@@ -1594,6 +1678,12 @@ object_registry_test: $(OBJ_DIR)/utilities/object_registry_test.o $(TEST_LIBRARY
 	$(AM_LINK)
 
 ttl_test: $(OBJ_DIR)/utilities/ttl/ttl_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
+trie_index_db_test: $(OBJ_DIR)/utilities/trie_index/trie_index_db_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
+trie_index_test: $(OBJ_DIR)/utilities/trie_index/trie_index_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
 types_util_test: $(OBJ_DIR)/utilities/types_util_test.o $(TEST_LIBRARY) $(LIBRARY)
@@ -1645,6 +1735,9 @@ io_posix_test: $(OBJ_DIR)/env/io_posix_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
 fault_injection_test: $(OBJ_DIR)/db/fault_injection_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
+fault_injection_fs_test: $(OBJ_DIR)/utilities/fault_injection_fs_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
 rate_limiter_test: $(OBJ_DIR)/util/rate_limiter_test.o $(TEST_LIBRARY) $(LIBRARY)
@@ -1845,6 +1938,9 @@ write_committed_transaction_ts_test: $(OBJ_DIR)/utilities/transactions/write_com
 write_prepared_transaction_test: $(OBJ_DIR)/utilities/transactions/write_prepared_transaction_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+write_prepared_transaction_seqno_test: $(OBJ_DIR)/utilities/transactions/write_prepared_transaction_seqno_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 write_unprepared_transaction_test: $(OBJ_DIR)/utilities/transactions/write_unprepared_transaction_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
@@ -1948,6 +2044,9 @@ blob_source_test: $(OBJ_DIR)/db/blob/blob_source_test.o $(TEST_LIBRARY) $(LIBRAR
 	$(AM_LINK)
 
 blob_garbage_meter_test: $(OBJ_DIR)/db/blob/blob_garbage_meter_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
+io_dispatcher_test: $(OBJ_DIR)/util/io_dispatcher_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
 timer_test: $(OBJ_DIR)/util/timer_test.o $(TEST_LIBRARY) $(LIBRARY)
@@ -2562,7 +2661,7 @@ list_all_tests:
 
 # Remove the rules for which dependencies should not be generated and see if any are left.
 #If so, include the dependencies; if not, do not include the dependency files
-ROCKS_DEP_RULES=$(filter-out clean format check-format check-buck-targets check-headers check-sources jclean jtest package analyze tags rocksdbjavastatic% unity.% unity_test checkout_folly, $(MAKECMDGOALS))
+ROCKS_DEP_RULES=$(filter-out clean format check-format check-buck-targets check-headers check-sources check-workflow-yaml clang-tidy jclean jtest package analyze tags rocksdbjavastatic% unity.% unity_test checkout_folly, $(MAKECMDGOALS))
 ifneq ("$(ROCKS_DEP_RULES)", "")
 -include $(DEPFILES)
 endif
