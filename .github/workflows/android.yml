@@ -63,5 +63,6 @@ jobs:
       with:
         name: rocksdb-android-aarch64-jni
         path: |
+          **/librocksdb.so
           **/librocksdbjni.so
         retention-days: 7
